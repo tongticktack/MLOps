@@ -127,7 +127,12 @@ def retrain(cutoff_dt: datetime | None = None) -> xgb.XGBRegressor:
     logger.info("Best params : %s", search.best_params_)
     logger.info("CV RMSE     : %.2f MWh", -search.best_score_)
 
-    # 5. Save model + record timestamp
+    # 5. Backup current model, save new model, record timestamp
+    backup_path = MODEL_PATH.with_name("window_model_backup.pkl")
+    if MODEL_PATH.exists():
+        import shutil
+        shutil.copy(MODEL_PATH, backup_path)
+        logger.info("Backup saved → %s", backup_path)
     joblib.dump(best, MODEL_PATH)
     record_retrain()
     logger.info("Model saved → %s  (%.1fs)", MODEL_PATH, time.time() - t0)

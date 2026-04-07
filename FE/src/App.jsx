@@ -31,6 +31,8 @@ const buildLinePath = (points, width, height, accessor, minValue, maxValue) => {
 
 export default function App() {
   const socketRef = useRef(null)
+  const isPausedRef = useRef(false)
+  const messageBufferRef = useRef([])
 
   const [selectedFile, setSelectedFile] = useState(null)
   const [isDragging, setIsDragging] = useState(false)
@@ -51,6 +53,8 @@ export default function App() {
   const [latestReport, setLatestReport] = useState('')
   const [typedReport, setTypedReport] = useState('')
   const [streamPoints, setStreamPoints] = useState([])
+  const [retrainRecordCounts, setRetrainRecordCounts] = useState([])
+  const [retrainPopup, setRetrainPopup] = useState(null) // { trainFrom, trainTo, reason }
 
   useEffect(() => {
     return () => {
@@ -110,13 +114,21 @@ export default function App() {
 
   const errorChart = useMemo(() => {
     if (!streamPoints.length) {
-      return { width: 1100, height: 120, bars: [] }
+      return { width: 1100, height: 120, bars: [], retrainMarkers: [] }
     }
 
     const width = 1100
     const height = 120
     const maxError = Math.max(...streamPoints.map((point) => point.error || 0), 1)
     const barWidth = width / Math.max(streamPoints.length, 1)
+
+    const firstCount = streamPoints[0]?.record_count ?? 0
+    const lastCount = streamPoints[streamPoints.length - 1]?.record_count ?? 0
+    const countRange = Math.max(lastCount - firstCount, 1)
+
+    const retrainMarkers = retrainRecordCounts
+      .filter((rc) => rc >= firstCount && rc <= lastCount)
+      .map((rc) => ((rc - firstCount) / countRange) * width)
 
     return {
       width,
@@ -125,10 +137,10 @@ export default function App() {
         x: index * barWidth,
         width: Math.max(barWidth - 2, 2),
         height: ((point.error || 0) / maxError) * height,
-        retrain: point.retrain,
       })),
+      retrainMarkers,
     }
-  }, [streamPoints])
+  }, [streamPoints, retrainRecordCounts])
 
   const latestPoint = streamPoints.at(-1)
   const statusTone =
@@ -138,13 +150,37 @@ export default function App() {
         ? 'border-amber-300/30 bg-amber-300/10 text-amber-200'
         : streamStatus === 'Streaming' || streamStatus === 'normal' || streamStatus === 'Completed'
           ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-300'
-          : 'border-slate-400/20 bg-slate-400/10 text-slate-300'
+          : streamStatus === 'Stopped'
+            ? 'border-rose-400/30 bg-rose-400/10 text-rose-300'
+            : 'border-slate-400/20 bg-slate-400/10 text-slate-300'
+
+  const closeRetrainPopup = () => {
+    setRetrainPopup(null)
+    isPausedRef.current = false
+    const buffered = messageBufferRef.current
+    messageBufferRef.current = []
+    const processMessage = socketRef.current?._processMessage
+    if (processMessage) buffered.forEach(processMessage)
+  }
+
+  const isStreaming = ['Streaming', 'Retraining', 'Warming Up', 'warning', 'drift', 'normal'].includes(streamStatus)
+
+  const stopStream = () => {
+    if (socketRef.current) {
+      socketRef.current.close()
+      socketRef.current = null
+    }
+    setStreamStatus('Stopped')
+    setIsLoading(false)
+  }
 
   const resetStream = () => {
     if (socketRef.current) {
       socketRef.current.close()
       socketRef.current = null
     }
+    isPausedRef.current = false
+    messageBufferRef.current = []
 
     setStreamStatus('Idle')
     setApiError('')
@@ -162,6 +198,7 @@ export default function App() {
     setLatestReport('')
     setTypedReport('')
     setStreamPoints([])
+    setRetrainRecordCounts([])
   }
 
   const handleFile = (file) => {
@@ -192,9 +229,7 @@ export default function App() {
       setIsLoading(false)
     }
 
-    socket.onmessage = (event) => {
-      const payload = JSON.parse(event.data)
-
+    const processMessage = (payload) => {
       if (payload?.error && typeof payload.error === 'object' && !Array.isArray(payload.error)) {
         setApiError(payload.error.message || '스트림 처리 중 오류가 발생했습니다.')
         setStreamStatus('Error')
@@ -249,8 +284,26 @@ export default function App() {
         setRetrainCount((current) => current + 1)
         setLatestRetrainReason(payload.retrain_reason ?? 'Threshold exceeded')
         setLastRetrainAt(payload.current_prediction_time ?? payload.timestamp ?? '')
+        setRetrainRecordCounts((current) => [...current, payload.record_count])
+        isPausedRef.current = true
+        setRetrainPopup({
+          trainFrom: payload.train_from ?? '-',
+          trainTo: payload.train_to ?? '-',
+          reason: payload.retrain_reason ?? 'RMSE_168h > threshold',
+        })
       }
     }
+
+    socket.onmessage = (event) => {
+      const payload = JSON.parse(event.data)
+      if (isPausedRef.current) {
+        messageBufferRef.current.push(payload)
+        return
+      }
+      processMessage(payload)
+    }
+
+    socket._processMessage = processMessage
 
     socket.onerror = () => {
       setApiError('WebSocket 연결에 실패했습니다.')
@@ -302,6 +355,48 @@ export default function App() {
 
   return (
     <main className="relative overflow-hidden text-slate-100">
+      {retrainPopup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="relative w-full max-w-md rounded-[2rem] border border-rose-400/30 bg-slate-950 p-8 shadow-2xl">
+            <div className="mb-6 flex items-center gap-4">
+              <span className="inline-flex h-12 w-12 animate-spin rounded-full border-4 border-rose-400 border-t-transparent" />
+              <div>
+                <p className="text-xs uppercase tracking-[0.3em] text-rose-400">MLOps Pipeline</p>
+                <h2 className="font-orbitron text-2xl font-bold text-white">모델 재학습 중</h2>
+              </div>
+            </div>
+
+            <div className="mb-6 space-y-3 rounded-[1.25rem] border border-white/10 bg-slate-900/80 p-5">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-slate-400">학습 데이터 시작</span>
+                <span className="font-mono font-semibold text-white">{retrainPopup.trainFrom}</span>
+              </div>
+              <div className="h-px bg-white/10" />
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-slate-400">학습 데이터 종료</span>
+                <span className="font-mono font-semibold text-white">{retrainPopup.trainTo}</span>
+              </div>
+              <div className="h-px bg-white/10" />
+              <div className="flex items-start justify-between gap-4 text-sm">
+                <span className="shrink-0 text-slate-400">트리거 사유</span>
+                <span className="text-right text-rose-300">{retrainPopup.reason}</span>
+              </div>
+            </div>
+
+            <p className="mb-6 text-center text-xs text-slate-500">
+              재학습이 완료되었습니다. 확인 후 스트림을 재개하세요.
+            </p>
+
+            <button
+              type="button"
+              onClick={closeRetrainPopup}
+              className="w-full rounded-full border border-spark-300/50 bg-gradient-to-r from-spark-400 to-spark-500 py-3 font-orbitron text-sm font-bold uppercase tracking-[0.2em] text-slate-950 transition hover:brightness-110"
+            >
+              확인 — 스트림 재개
+            </button>
+          </div>
+        </div>
+      )}
       <div className="pointer-events-none absolute inset-0 bg-grid bg-[size:42px_42px] opacity-10" />
       <div className="pointer-events-none absolute left-[-8rem] top-16 h-72 w-72 rounded-full bg-bolt-500/20 blur-3xl" />
       <div className="pointer-events-none absolute right-[-5rem] top-40 h-64 w-64 rounded-full bg-spark-400/20 blur-3xl" />
@@ -393,23 +488,50 @@ export default function App() {
                     </svg>
                   </div>
 
-                  <div className="overflow-hidden rounded-[1.25rem] border border-white/10 bg-slate-950/70 p-4">
+                  <div className="rounded-[1.25rem] border border-white/10 bg-slate-950/70 p-4">
                     <div className="mb-3 flex items-center justify-between">
                       <p className="text-sm font-semibold text-white">Absolute Error Stream</p>
                       <p className="text-xs uppercase tracking-[0.2em] text-slate-500">|y - y_hat|</p>
                     </div>
-                    <svg viewBox={`0 0 ${errorChart.width} ${errorChart.height}`} className="h-28 w-full">
+                    <svg viewBox={`0 0 ${errorChart.width} ${errorChart.height + 28}`} className="h-36 w-full">
+                      {/* 막대 */}
                       {errorChart.bars.map((bar, index) => (
                         <rect
                           key={index}
                           x={bar.x}
-                          y={errorChart.height - bar.height}
+                          y={errorChart.height + 28 - bar.height}
                           width={bar.width}
                           height={bar.height}
                           rx="3"
-                          fill={bar.retrain ? '#fb7185' : '#38bdf8'}
-                          opacity={bar.retrain ? '0.95' : '0.75'}
+                          fill="#38bdf8"
+                          opacity="0.75"
                         />
+                      ))}
+                      {/* retrain 마커 — record_count 기반으로 항상 추적 */}
+                      {errorChart.retrainMarkers.map((x, i) => (
+                        <g key={`rm-${i}`}>
+                          <line
+                            x1={x}
+                            x2={x}
+                            y1={0}
+                            y2={errorChart.height + 28}
+                            stroke="#fb7185"
+                            strokeWidth="3"
+                            strokeDasharray="6 4"
+                          />
+                          <rect x={x - 32} y={4} width="64" height="22" rx="5" fill="#fb7185" />
+                          <text
+                            x={x}
+                            y={19}
+                            textAnchor="middle"
+                            fontSize="11"
+                            fontWeight="bold"
+                            fill="white"
+                            fontFamily="monospace"
+                          >
+                            RETRAIN
+                          </text>
+                        </g>
                       ))}
                     </svg>
                   </div>
@@ -548,26 +670,40 @@ export default function App() {
                 <p className="font-semibold text-white">실제 연동 대상</p>
                 <p>`POST {API_URL}` 로 세션을 만들고, 이후 `WS {WS_URL}` 스트림을 실시간 수신합니다. 재학습 threshold는 백엔드 고정값을 사용합니다.</p>
               </div>
-              <button
-                type="button"
-                onClick={submitPrediction}
-                disabled={!selectedFile || isLoading}
-                className="inline-flex min-w-fit whitespace-nowrap items-center justify-center gap-2 rounded-full border border-spark-300/50 bg-gradient-to-r from-spark-400 to-spark-500 px-[clamp(1rem,3vw,1.5rem)] py-[clamp(0.75rem,2vw,0.95rem)] font-orbitron text-[clamp(0.7rem,1.8vw,0.875rem)] font-bold uppercase tracking-[clamp(0.08em,0.18vw,0.2em)] text-slate-950 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {isLoading ? (
-                  <>
-                    <span className="inline-flex h-5 w-5 animate-spin rounded-full border-2 border-slate-950 border-t-transparent" />
-                    세션 생성 중
-                  </>
-                ) : (
-                  <>
+              <div className="flex gap-3">
+                {isStreaming && (
+                  <button
+                    type="button"
+                    onClick={stopStream}
+                    className="inline-flex min-w-fit whitespace-nowrap items-center justify-center gap-2 rounded-full border border-rose-400/50 bg-gradient-to-r from-rose-500 to-rose-600 px-[clamp(1rem,3vw,1.5rem)] py-[clamp(0.75rem,2vw,0.95rem)] font-orbitron text-[clamp(0.7rem,1.8vw,0.875rem)] font-bold uppercase tracking-[clamp(0.08em,0.18vw,0.2em)] text-white transition hover:brightness-110"
+                  >
                     <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current">
-                      <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z" />
+                      <rect x="4" y="4" width="16" height="16" rx="2" />
                     </svg>
-                    스트림 시작
-                  </>
+                    스트림 중단
+                  </button>
                 )}
-              </button>
+                <button
+                  type="button"
+                  onClick={submitPrediction}
+                  disabled={!selectedFile || isLoading}
+                  className="inline-flex min-w-fit whitespace-nowrap items-center justify-center gap-2 rounded-full border border-spark-300/50 bg-gradient-to-r from-spark-400 to-spark-500 px-[clamp(1rem,3vw,1.5rem)] py-[clamp(0.75rem,2vw,0.95rem)] font-orbitron text-[clamp(0.7rem,1.8vw,0.875rem)] font-bold uppercase tracking-[clamp(0.08em,0.18vw,0.2em)] text-slate-950 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {isLoading ? (
+                    <>
+                      <span className="inline-flex h-5 w-5 animate-spin rounded-full border-2 border-slate-950 border-t-transparent" />
+                      세션 생성 중
+                    </>
+                  ) : (
+                    <>
+                      <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current">
+                        <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z" />
+                      </svg>
+                      스트림 시작
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
 
             {apiError ? (

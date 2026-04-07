@@ -7,7 +7,18 @@ from pathlib import Path
 import joblib
 import xgboost as xgb
 
-_MODEL_PATH = Path(__file__).parent / "window_model.pkl"
+_MODEL_PATH    = Path(__file__).parent / "window_model.pkl"
+_PRETRAIN_PATH = Path(__file__).parent / "window_model_pretrain.pkl"
+
+
+def load_pretrain_model() -> xgb.XGBRegressor:
+    """Load the fixed pretrain model. Never overwritten by retrain."""
+    if not _PRETRAIN_PATH.exists():
+        raise FileNotFoundError(
+            f"Pretrain model not found at {_PRETRAIN_PATH}.\n"
+            "Copy window_model.pkl → window_model_pretrain.pkl first."
+        )
+    return joblib.load(_PRETRAIN_PATH)
 
 
 def load_model(path: Path | None = None) -> xgb.XGBRegressor:

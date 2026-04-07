@@ -17,16 +17,23 @@ STATE_PATH   = Path(__file__).parent / "last_retrain.json"
 COOLDOWN_DAYS = 7
 
 
-def can_retrain(cooldown_days: int = COOLDOWN_DAYS) -> bool:
+def can_retrain(cooldown_days: int = COOLDOWN_DAYS, reference_dt: datetime | None = None) -> bool:
     """
     Return True if enough time has passed since the last retrain.
     Always returns True if no prior retrain has been recorded.
+
+    Parameters
+    ----------
+    reference_dt : Timestamp to compare against (defaults to datetime.now()).
+                   Pass the current data timestamp when evaluating historical data
+                   so that cooldown is judged relative to the data timeline, not wall time.
     """
     if not STATE_PATH.exists():
         return True
     state     = json.loads(STATE_PATH.read_text())
     last_dt   = datetime.fromisoformat(state["last_retrain"])
-    elapsed   = datetime.now() - last_dt
+    now       = reference_dt if reference_dt is not None else datetime.now()
+    elapsed   = now - last_dt
     return elapsed >= timedelta(days=cooldown_days)
 
 

@@ -4,7 +4,7 @@ import asyncio
 import json
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -22,20 +22,22 @@ from api import trigger_retrain  # type: ignore  # noqa: E402
 from drift.decision import classify_status  # type: ignore  # noqa: E402
 from drift.evaluator import evaluate  # type: ignore  # noqa: E402
 from drift.sliding_window import forecast_24h  # type: ignore  # noqa: E402
-from model.load_model import load_model  # type: ignore  # noqa: E402
-from retrain.scheduler import STATE_PATH, can_retrain  # type: ignore  # noqa: E402
+from model.load_model import load_model, load_pretrain_model  # type: ignore  # noqa: E402
+from retrain.scheduler import STATE_PATH  # type: ignore  # noqa: E402
 
 
 STREAM_SESSIONS: dict[str, dict[str, Any]] = {}
-DEFAULT_STREAM_DELAY_SECONDS = 0.2
+DEFAULT_STREAM_DELAY_SECONDS = 0.05
 
 
 def create_prediction_session(contents: bytes, filename: str) -> dict[str, Any]:
     input_df = parse_power_csv(contents)
-    model = load_model()
-    predictions, blocks, baseline_rmse = evaluate(model, input_df)
+
+    # Always start from the fixed pretrain model — never affected by previous retrains.
+    pretrain_model = load_pretrain_model()
+    predictions, blocks, baseline_rmse = evaluate(pretrain_model, input_df)
     threshold = baseline_rmse * 1.2
-    forecast_series = forecast_24h(model, input_df)
+    forecast_series = forecast_24h(pretrain_model, input_df)
 
     session_id = uuid.uuid4().hex
     STREAM_SESSIONS[session_id] = {
@@ -43,7 +45,7 @@ def create_prediction_session(contents: bytes, filename: str) -> dict[str, Any]:
         "filename": filename,
         "created_at": datetime.utcnow().isoformat(),
         "predictions": predictions,
-        "blocks": blocks,
+        "input_df": input_df,          # kept for post-retrain re-evaluation
         "baseline_rmse": float(baseline_rmse),
         "threshold": float(threshold),
         "forecast": forecast_series,
@@ -68,26 +70,55 @@ async def stream_prediction_session(websocket: WebSocket, session_id: str) -> No
         return
 
     predictions: pd.DataFrame = session["predictions"]
+    input_df: pd.DataFrame = session["input_df"]
     threshold = float(session["threshold"])
     baseline_rmse = float(session["baseline_rmse"])
     retrain_count = 0
     retrain_emitted = False
 
-    for index, (timestamp, row) in enumerate(predictions.iterrows(), start=1):
+    # Use a list of timestamps so we can swap predictions mid-stream after retrain.
+    timestamps = list(predictions.index)
+    index = 0
+
+    while index < len(timestamps):
+        timestamp = timestamps[index]
+        row = predictions.loc[timestamp]
+        stream_index = index + 1
+
         rmse_24h = _safe_round(row.get("rmse_24h"))
         rmse_168h = _safe_round(row.get("rmse_168h"))
         status = _classify_stream_status(rmse_24h, rmse_168h, baseline_rmse)
         retrain = False
         retrain_reason = None
+        train_from = None
+        train_to = None
 
-        # Spec alignment: evaluate drift on 24h block boundaries and retrain once per session when allowed.
-        if index % 24 == 0 and status == "drift" and not retrain_emitted and can_retrain():
-            retrain_result = trigger_retrain(force=False)
+        if stream_index % 24 == 0 and status == "drift" and not retrain_emitted:
+            # Retrain using CSV data up to the drift timestamp (not wall-clock time).
+            retrain_result = trigger_retrain(cutoff_dt=timestamp.to_pydatetime(), force=True)
             retrain = retrain_result.success
             retrain_emitted = retrain_result.success
+            retrain_reason = retrain_result.message
+
             if retrain_result.success:
                 retrain_count += 1
-            retrain_reason = retrain_result.message
+                train_from = (timestamp - timedelta(days=91)).strftime("%Y-%m-%d")
+                train_to = timestamp.strftime("%Y-%m-%d")
+
+                # Re-evaluate remaining data with the newly trained model.
+                new_model = load_model()
+                seed = input_df[input_df.index <= timestamp].iloc[-168:]
+                remaining = input_df[input_df.index > timestamp]
+
+                if len(remaining) > 0 and len(seed) == 168:
+                    eval_df = pd.concat([seed, remaining])
+                    new_predictions, _, _ = evaluate(new_model, eval_df)
+                    # Splice new predictions into the predictions DataFrame.
+                    for ts, new_row in new_predictions.iterrows():
+                        if ts in predictions.index:
+                            predictions.loc[ts] = new_row
+                    # Refresh timestamp list (index unchanged, future rows updated).
+                    timestamps = list(predictions.index)
 
         payload = {
             "timestamp": timestamp.isoformat(),
@@ -97,10 +128,12 @@ async def stream_prediction_session(websocket: WebSocket, session_id: str) -> No
             "rmse": rmse_24h,
             "rmse_24h": rmse_24h,
             "rmse_168h": rmse_168h,
-            "record_count": index,
+            "record_count": stream_index,
             "current_prediction_time": timestamp.isoformat(),
             "retrain": retrain,
             "retrain_reason": retrain_reason,
+            "train_from": train_from,
+            "train_to": train_to,
             "threshold": round(threshold, 2),
             "baseline_rmse": round(baseline_rmse, 2),
             "session_id": session_id,
@@ -120,12 +153,13 @@ async def stream_prediction_session(websocket: WebSocket, session_id: str) -> No
         }
         await websocket.send_json(payload)
         await asyncio.sleep(DEFAULT_STREAM_DELAY_SECONDS)
+        index += 1
 
     await websocket.send_json(
         {
             "event": "stream_complete",
             "session_id": session_id,
-            "record_count": int(len(predictions)),
+            "record_count": len(timestamps),
             "retrain_count": retrain_count,
             "last_retrain": _read_last_retrain_timestamp(),
         }

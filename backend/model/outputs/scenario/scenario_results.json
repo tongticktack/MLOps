@@ -1,0 +1,47 @@
+{
+  "jan": {
+    "n_predictions": 743,
+    "window_size": 168,
+    "RMSE": 801.1063,
+    "MAE": 595.2302,
+    "MAPE": 0.8812,
+    "threshold": 961.3276045544026,
+    "status": "normal",
+    "overall_status": "warning",
+    "baseline_rmse": 801.11,
+    "retrained": false,
+    "normal": 21,
+    "warning": 3,
+    "drift": 0
+  },
+  "feb": {
+    "n_predictions": 672,
+    "window_size": 168,
+    "RMSE": 960.8666,
+    "MAE": 673.2338,
+    "MAPE": 0.9585,
+    "threshold": 961.3276045544026,
+    "status": "normal",
+    "overall_status": "drift",
+    "baseline_rmse": 801.11,
+    "retrained": true,
+    "normal": 12,
+    "warning": 0,
+    "drift": 10
+  },
+  "mar": {
+    "n_predictions": 744,
+    "window_size": 168,
+    "RMSE": 893.1258,
+    "MAE": 614.9808,
+    "MAPE": 1.012,
+    "threshold": 961.3276045544026,
+    "status": "normal",
+    "overall_status": "drift",
+    "baseline_rmse": 801.11,
+    "retrained": false,
+    "normal": 21,
+    "warning": 2,
+    "drift": 2
+  }
+}
