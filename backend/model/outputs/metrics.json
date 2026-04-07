@@ -1,0 +1,16 @@
+{
+  "n_predictions": 1415,
+  "window_size": 168,
+  "RMSE": 859.7639,
+  "MAE": 619.9392,
+  "MAPE": 0.8986,
+  "threshold": 904.21,
+  "status": "normal",
+  "baseline_rmse": 753.51,
+  "overall_status": "drift",
+  "retrained": false,
+  "total_blocks": 52,
+  "normal": 28,
+  "warning": 5,
+  "drift": 19
+}

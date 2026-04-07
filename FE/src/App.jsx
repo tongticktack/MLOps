@@ -4,8 +4,6 @@ const API_URL = 'http://localhost:7070/predict'
 const WS_URL = 'ws://localhost:7070/ws/mlops'
 const MAX_POINTS = 96
 
-const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
-
 const formatNumber = (value) => {
   if (value === null || value === undefined || Number.isNaN(value)) return '-'
   return new Intl.NumberFormat('ko-KR', { maximumFractionDigits: 2 }).format(value)
@@ -39,9 +37,12 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false)
   const [streamStatus, setStreamStatus] = useState('Idle')
   const [apiError, setApiError] = useState('')
-  const [threshold, setThreshold] = useState(5)
   const [sessionId, setSessionId] = useState('')
   const [rmse, setRmse] = useState('-')
+  const [rmse24h, setRmse24h] = useState('-')
+  const [rmse168h, setRmse168h] = useState('-')
+  const [threshold, setThreshold] = useState('-')
+  const [baselineRmse, setBaselineRmse] = useState('-')
   const [recordCount, setRecordCount] = useState(0)
   const [currentPredictionTime, setCurrentPredictionTime] = useState('')
   const [retrainCount, setRetrainCount] = useState(0)
@@ -107,7 +108,37 @@ export default function App() {
     }
   }, [streamPoints])
 
+  const errorChart = useMemo(() => {
+    if (!streamPoints.length) {
+      return { width: 1100, height: 120, bars: [] }
+    }
+
+    const width = 1100
+    const height = 120
+    const maxError = Math.max(...streamPoints.map((point) => point.error || 0), 1)
+    const barWidth = width / Math.max(streamPoints.length, 1)
+
+    return {
+      width,
+      height,
+      bars: streamPoints.map((point, index) => ({
+        x: index * barWidth,
+        width: Math.max(barWidth - 2, 2),
+        height: ((point.error || 0) / maxError) * height,
+        retrain: point.retrain,
+      })),
+    }
+  }, [streamPoints])
+
   const latestPoint = streamPoints.at(-1)
+  const statusTone =
+    streamStatus === 'drift' || streamStatus === 'Error'
+      ? 'border-rose-400/30 bg-rose-400/10 text-rose-200'
+      : streamStatus === 'warning' || streamStatus === 'Retraining'
+        ? 'border-amber-300/30 bg-amber-300/10 text-amber-200'
+        : streamStatus === 'Streaming' || streamStatus === 'normal' || streamStatus === 'Completed'
+          ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-300'
+          : 'border-slate-400/20 bg-slate-400/10 text-slate-300'
 
   const resetStream = () => {
     if (socketRef.current) {
@@ -119,6 +150,10 @@ export default function App() {
     setApiError('')
     setSessionId('')
     setRmse('-')
+    setRmse24h('-')
+    setRmse168h('-')
+    setThreshold('-')
+    setBaselineRmse('-')
     setRecordCount(0)
     setCurrentPredictionTime('')
     setRetrainCount(0)
@@ -146,10 +181,10 @@ export default function App() {
     handleFile(event.dataTransfer.files?.[0])
   }
 
-  const openStream = (sessionIdValue, thresholdValue) => {
+  const openStream = (sessionIdValue) => {
     if (socketRef.current) socketRef.current.close()
 
-    const socket = new WebSocket(`${WS_URL}?session_id=${sessionIdValue}&threshold=${thresholdValue}`)
+    const socket = new WebSocket(`${WS_URL}?session_id=${sessionIdValue}`)
     socketRef.current = socket
 
     socket.onopen = () => {
@@ -160,7 +195,7 @@ export default function App() {
     socket.onmessage = (event) => {
       const payload = JSON.parse(event.data)
 
-      if (payload?.error) {
+      if (payload?.error && typeof payload.error === 'object' && !Array.isArray(payload.error)) {
         setApiError(payload.error.message || '스트림 처리 중 오류가 발생했습니다.')
         setStreamStatus('Error')
         return
@@ -178,20 +213,37 @@ export default function App() {
         y_hat: payload.y_hat,
         error: payload.error,
         rmse: payload.rmse,
+        rmse_24h: payload.rmse_24h,
+        rmse_168h: payload.rmse_168h,
         record_count: payload.record_count,
         current_prediction_time: payload.current_prediction_time,
         retrain: payload.retrain,
         retrain_reason: payload.retrain_reason,
         threshold: payload.threshold,
+        baseline_rmse: payload.baseline_rmse,
         llm_report: payload.llm_report,
       }
 
       setStreamPoints((current) => [...current.slice(-(MAX_POINTS - 1)), point])
       setRmse(typeof payload.rmse === 'number' ? `${payload.rmse}%` : String(payload.rmse ?? '-'))
+      setRmse24h(payload.rmse_24h === null || payload.rmse_24h === undefined ? '-' : `${payload.rmse_24h} MWh`)
+      setRmse168h(payload.rmse_168h === null || payload.rmse_168h === undefined ? '-' : `${payload.rmse_168h} MWh`)
+      setThreshold(payload.threshold === null || payload.threshold === undefined ? '-' : `${payload.threshold} MWh`)
+      setBaselineRmse(payload.baseline_rmse === null || payload.baseline_rmse === undefined ? '-' : `${payload.baseline_rmse} MWh`)
       setRecordCount(payload.record_count ?? 0)
       setCurrentPredictionTime(payload.current_prediction_time ?? '')
       setLatestReport(payload.llm_report ?? '')
-      setStreamStatus(payload.pipeline_status === 'retraining' ? 'Retraining' : 'Streaming')
+      setStreamStatus(
+        payload.pipeline_status === 'retraining'
+          ? 'Retraining'
+          : payload.pipeline_status === 'warming_up'
+            ? 'Warming Up'
+            : payload.pipeline_status === 'warning'
+              ? 'warning'
+              : payload.pipeline_status === 'drift'
+                ? 'drift'
+                : 'normal'
+      )
 
       if (payload.retrain) {
         setRetrainCount((current) => current + 1)
@@ -240,7 +292,7 @@ export default function App() {
 
       setSessionId(payload.session_id ?? '')
       setRecordCount(payload.record_count ?? 0)
-      openStream(payload.session_id, threshold)
+      openStream(payload.session_id)
     } catch (error) {
       setApiError(error.message || '백엔드 연결에 실패했습니다.')
       setStreamStatus('Error')
@@ -341,6 +393,27 @@ export default function App() {
                     </svg>
                   </div>
 
+                  <div className="overflow-hidden rounded-[1.25rem] border border-white/10 bg-slate-950/70 p-4">
+                    <div className="mb-3 flex items-center justify-between">
+                      <p className="text-sm font-semibold text-white">Absolute Error Stream</p>
+                      <p className="text-xs uppercase tracking-[0.2em] text-slate-500">|y - y_hat|</p>
+                    </div>
+                    <svg viewBox={`0 0 ${errorChart.width} ${errorChart.height}`} className="h-28 w-full">
+                      {errorChart.bars.map((bar, index) => (
+                        <rect
+                          key={index}
+                          x={bar.x}
+                          y={errorChart.height - bar.height}
+                          width={bar.width}
+                          height={bar.height}
+                          rx="3"
+                          fill={bar.retrain ? '#fb7185' : '#38bdf8'}
+                          opacity={bar.retrain ? '0.95' : '0.75'}
+                        />
+                      ))}
+                    </svg>
+                  </div>
+
                   <div className="flex flex-wrap items-center gap-5 text-xs uppercase tracking-[0.22em] text-slate-400">
                     <div className="flex items-center gap-2">
                       <span className="h-3 w-6 rounded-full bg-bolt-300" />
@@ -376,17 +449,14 @@ export default function App() {
         </section>
 
         <section className="grid gap-6">
-          <div className="grid gap-6 lg:grid-cols-5">
+          <div className="grid gap-6 lg:grid-cols-6">
             {[
-              { label: 'RMSE', value: rmse, tone: 'from-spark-400/15 to-slate-950/70' },
-              { label: 'Threshold', value: `${threshold}%`, tone: 'from-bolt-500/15 to-slate-950/70' },
+              { label: 'RMSE 24H', value: rmse24h, tone: 'from-spark-400/15 to-slate-950/70' },
+              { label: 'RMSE 168H', value: rmse168h, tone: 'from-bolt-500/15 to-slate-950/70' },
+              { label: 'Threshold', value: threshold, tone: 'from-white/10 to-slate-950/70' },
+              { label: 'Baseline RMSE', value: baselineRmse, tone: 'from-cyan-400/10 to-slate-950/70' },
               { label: 'Data Points', value: String(recordCount || 0), tone: 'from-emerald-400/10 to-slate-950/70' },
               { label: 'Retrain Count', value: String(retrainCount), tone: 'from-rose-400/10 to-slate-950/70' },
-              {
-                label: 'Last Retrain',
-                value: lastRetrainAt ? formatDateTime(lastRetrainAt) : 'No retrain',
-                tone: 'from-orange-400/10 to-slate-950/70',
-              },
             ].map((item) => (
               <div
                 key={item.label}
@@ -406,7 +476,13 @@ export default function App() {
             ].map(([label, value]) => (
               <div key={label} className="rounded-[1.75rem] border border-white/10 bg-slate-950/60 p-5 backdrop-blur-xl">
                 <p className="text-xs uppercase tracking-[0.22em] text-slate-500">{label}</p>
-                <p className="mt-3 font-semibold text-white">{value}</p>
+                {label === 'Pipeline' ? (
+                  <span className={`mt-3 inline-flex rounded-full border px-3 py-2 text-sm font-semibold uppercase tracking-[0.18em] ${statusTone}`}>
+                    {value}
+                  </span>
+                ) : (
+                  <p className="mt-3 font-semibold text-white">{value}</p>
+                )}
               </div>
             ))}
           </div>
@@ -424,7 +500,7 @@ export default function App() {
               </div>
             </div>
 
-            <div className="grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
+            <div className="grid gap-6">
               <div
                 onDragOver={(event) => {
                   event.preventDefault()
@@ -465,48 +541,12 @@ export default function App() {
                   </div>
                 </div>
               </div>
-
-              <div className="rounded-[1.75rem] border border-white/10 bg-slate-950/55 p-5">
-                <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Retrain Threshold</p>
-                <div className="mt-3 flex items-center gap-4">
-                  <input
-                    type="range"
-                    min="1"
-                    max="20"
-                    step="0.5"
-                    value={threshold}
-                    onChange={(event) => setThreshold(clamp(Number(event.target.value), 1, 20))}
-                    className="w-full accent-yellow-400"
-                  />
-                  <input
-                    type="number"
-                    min="1"
-                    max="20"
-                    step="0.5"
-                    value={threshold}
-                    onChange={(event) => setThreshold(clamp(Number(event.target.value || 1), 1, 20))}
-                    className="w-24 rounded-xl border border-white/10 bg-slate-900 px-3 py-2 text-right text-white"
-                  />
-                </div>
-                <p className="mt-3 text-sm leading-6 text-slate-300">
-                  누적 RMSE가 임계치를 넘으면 재학습 이벤트를 표시합니다. 현재 세션은 `session_id`와 `threshold`
-                  를 포함해 `ws://localhost:7070/ws/mlops`에 연결됩니다.
-                </p>
-                <div className="mt-5 grid gap-3">
-                  <div className="rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-3 text-sm text-slate-300">
-                    Session ID: <span className="font-mono text-white">{sessionId || '-'}</span>
-                  </div>
-                  <div className="rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-3 text-sm text-slate-300">
-                    Last Retrain: <span className="text-white">{latestRetrainReason || 'No retrain event yet'}</span>
-                  </div>
-                </div>
-              </div>
             </div>
 
             <div className="mt-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
               <div className="text-sm leading-6 text-slate-300">
                 <p className="font-semibold text-white">실제 연동 대상</p>
-                <p>`POST {API_URL}` 로 세션을 만들고, 이후 `WS {WS_URL}` 스트림을 실시간 수신합니다.</p>
+                <p>`POST {API_URL}` 로 세션을 만들고, 이후 `WS {WS_URL}` 스트림을 실시간 수신합니다. 재학습 threshold는 백엔드 고정값을 사용합니다.</p>
               </div>
               <button
                 type="button"
@@ -535,6 +575,18 @@ export default function App() {
                 {apiError}
               </div>
             ) : null}
+
+            <div className="mt-4 grid gap-3">
+              <div className="rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-3 text-sm text-slate-300">
+                Session ID: <span className="font-mono text-white">{sessionId || '-'}</span>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-3 text-sm text-slate-300">
+                Last Retrain: <span className="text-white">{lastRetrainAt ? formatDateTime(lastRetrainAt) : 'No retrain event yet'}</span>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-3 text-sm text-slate-300">
+                Retrain Reason: <span className="text-white">{latestRetrainReason || 'No retrain event yet'}</span>
+              </div>
+            </div>
           </div>
 
           <div className="rounded-[2rem] border border-white/10 bg-white/5 p-6 shadow-neon backdrop-blur-xl">

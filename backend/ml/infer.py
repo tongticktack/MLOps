@@ -1,135 +1,184 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-import numpy as np
+import pandas as pd
 from fastapi import WebSocket
 
-from backend.ml.model import TARGET_COLUMN, parse_power_csv
+from backend.ml.model import parse_power_csv
+
+
+MODEL_ROOT = Path(__file__).resolve().parents[1] / "model"
+if str(MODEL_ROOT) not in sys.path:
+    sys.path.insert(0, str(MODEL_ROOT))
+
+from api import trigger_retrain  # type: ignore  # noqa: E402
+from drift.decision import classify_status  # type: ignore  # noqa: E402
+from drift.evaluator import evaluate  # type: ignore  # noqa: E402
+from drift.sliding_window import forecast_24h  # type: ignore  # noqa: E402
+from model.load_model import load_model  # type: ignore  # noqa: E402
+from retrain.scheduler import STATE_PATH, can_retrain  # type: ignore  # noqa: E402
 
 
 STREAM_SESSIONS: dict[str, dict[str, Any]] = {}
-DEFAULT_STREAM_DELAY_SECONDS = 0.35
+DEFAULT_STREAM_DELAY_SECONDS = 0.2
 
 
 def create_prediction_session(contents: bytes, filename: str) -> dict[str, Any]:
-    parsed = parse_power_csv(contents)
-    session_id = uuid.uuid4().hex
-    stream_frame = parsed.stream_df.tail(24 * 21).reset_index(drop=True)
+    input_df = parse_power_csv(contents)
+    model = load_model()
+    predictions, blocks, baseline_rmse = evaluate(model, input_df)
+    threshold = baseline_rmse * 1.2
+    forecast_series = forecast_24h(model, input_df)
 
+    session_id = uuid.uuid4().hex
     STREAM_SESSIONS[session_id] = {
         "session_id": session_id,
         "filename": filename,
         "created_at": datetime.utcnow().isoformat(),
-        "record_count": parsed.original_rows,
-        "stream_frame": stream_frame,
+        "predictions": predictions,
+        "blocks": blocks,
+        "baseline_rmse": float(baseline_rmse),
+        "threshold": float(threshold),
+        "forecast": forecast_series,
     }
 
     return {
         "session_id": session_id,
-        "record_count": parsed.original_rows,
+        "record_count": int(len(predictions)),
         "filename": filename,
         "stream_url": f"ws://localhost:7070/ws/mlops?session_id={session_id}",
+        "baseline_rmse": round(float(baseline_rmse), 2),
+        "threshold": round(float(threshold), 2),
+        "forecast_horizon": int(len(forecast_series)),
     }
 
 
-async def stream_prediction_session(websocket: WebSocket, session_id: str, threshold: float) -> None:
+async def stream_prediction_session(websocket: WebSocket, session_id: str) -> None:
     session = STREAM_SESSIONS.get(session_id)
     if not session:
         await websocket.send_json({"error": {"code": "SESSION_NOT_FOUND", "message": "유효하지 않은 세션입니다."}})
         await websocket.close(code=4404)
         return
 
-    stream_frame = session["stream_frame"]
-    errors: list[float] = []
-    retrain_points = 0
-    model_bias = 0.025
-    threshold = max(float(threshold), 0.1)
+    predictions: pd.DataFrame = session["predictions"]
+    threshold = float(session["threshold"])
+    baseline_rmse = float(session["baseline_rmse"])
+    retrain_count = 0
+    retrain_emitted = False
 
-    for index in range(24, len(stream_frame)):
-        current_row = stream_frame.iloc[index]
-        lag_24 = float(stream_frame.iloc[index - 24][TARGET_COLUMN])
-        rolling_24 = float(stream_frame.iloc[max(0, index - 24) : index][TARGET_COLUMN].mean())
-        y = float(current_row[TARGET_COLUMN])
-        y_hat = _predict_next_value(lag_24=lag_24, rolling_24=rolling_24, step=index, model_bias=model_bias)
-        error = abs(y - y_hat)
-        errors.append(error)
-        rmse = float(np.sqrt(np.mean(np.square(errors))))
-        baseline = max(float(stream_frame.iloc[: index + 1][TARGET_COLUMN].mean()), 1.0)
-        rmse_percent = round((rmse / baseline) * 100, 2)
-
-        retrain = rmse_percent > threshold
+    for index, (timestamp, row) in enumerate(predictions.iterrows(), start=1):
+        rmse_24h = _safe_round(row.get("rmse_24h"))
+        rmse_168h = _safe_round(row.get("rmse_168h"))
+        status = _classify_stream_status(rmse_24h, rmse_168h, baseline_rmse)
+        retrain = False
         retrain_reason = None
-        if retrain:
-            retrain_points += 1
-            retrain_reason = f"RMSE {rmse_percent:.2f}% exceeded threshold {threshold:.2f}%"
-            model_bias = 0.0
-            errors = [abs(y - ((y + lag_24 + rolling_24) / 3))]
-            rmse = float(np.sqrt(np.mean(np.square(errors))))
-            rmse_percent = round((rmse / baseline) * 100, 2)
-        else:
-            model_bias = min(model_bias + 0.0008, 0.06)
 
-        await websocket.send_json(
-            {
-                "timestamp": current_row["datetime"].isoformat(),
-                "y": round(y, 2),
-                "y_hat": round(y_hat, 2),
-                "error": round(error, 2),
-                "rmse": rmse_percent,
-                "record_count": int(index + 1),
-                "current_prediction_time": current_row["datetime"].isoformat(),
-                "retrain": retrain,
-                "retrain_reason": retrain_reason,
-                "threshold": round(threshold, 2),
-                "session_id": session_id,
-                "pipeline_status": "retraining" if retrain else "streaming",
-                "llm_report": _build_stream_report(
-                    y=y,
-                    y_hat=y_hat,
-                    rmse_percent=rmse_percent,
-                    retrain=retrain,
-                    retrain_reason=retrain_reason,
-                    retrain_points=retrain_points,
-                ),
-            }
-        )
+        # Spec alignment: evaluate drift on 24h block boundaries and retrain once per session when allowed.
+        if index % 24 == 0 and status == "drift" and not retrain_emitted and can_retrain():
+            retrain_result = trigger_retrain(force=False)
+            retrain = retrain_result.success
+            retrain_emitted = retrain_result.success
+            if retrain_result.success:
+                retrain_count += 1
+            retrain_reason = retrain_result.message
+
+        payload = {
+            "timestamp": timestamp.isoformat(),
+            "y": round(float(row["y_true"]), 2),
+            "y_hat": round(float(row["y_pred"]), 2),
+            "error": round(abs(float(row["error"])), 2),
+            "rmse": rmse_24h,
+            "rmse_24h": rmse_24h,
+            "rmse_168h": rmse_168h,
+            "record_count": index,
+            "current_prediction_time": timestamp.isoformat(),
+            "retrain": retrain,
+            "retrain_reason": retrain_reason,
+            "threshold": round(threshold, 2),
+            "baseline_rmse": round(baseline_rmse, 2),
+            "session_id": session_id,
+            "pipeline_status": "retraining" if retrain else status,
+            "llm_report": _build_stream_report(
+                timestamp=timestamp,
+                y=float(row["y_true"]),
+                y_hat=float(row["y_pred"]),
+                rmse_24h=rmse_24h,
+                rmse_168h=rmse_168h,
+                threshold=threshold,
+                status=status,
+                retrain=retrain,
+                retrain_reason=retrain_reason,
+                retrain_count=retrain_count,
+            ),
+        }
+        await websocket.send_json(payload)
         await asyncio.sleep(DEFAULT_STREAM_DELAY_SECONDS)
 
     await websocket.send_json(
         {
             "event": "stream_complete",
             "session_id": session_id,
-            "record_count": int(len(stream_frame)),
-            "retrain_count": retrain_points,
+            "record_count": int(len(predictions)),
+            "retrain_count": retrain_count,
+            "last_retrain": _read_last_retrain_timestamp(),
         }
     )
 
 
-def _predict_next_value(lag_24: float, rolling_24: float, step: int, model_bias: float) -> float:
-    seasonal_boost = np.sin(step / 6.0) * 0.018
-    return (lag_24 * (0.58 + seasonal_boost)) + (rolling_24 * (0.42 - seasonal_boost)) + (rolling_24 * model_bias)
-
-
 def _build_stream_report(
+    timestamp: pd.Timestamp,
     y: float,
     y_hat: float,
-    rmse_percent: float,
+    rmse_24h: float | None,
+    rmse_168h: float | None,
+    threshold: float,
+    status: str,
     retrain: bool,
     retrain_reason: str | None,
-    retrain_points: int,
+    retrain_count: int,
 ) -> str:
     direction = "상향" if y_hat >= y else "하향"
     base = (
-        f"현재 예측값은 {y_hat:.2f}, 실제값은 {y:.2f}이며 오차는 {abs(y - y_hat):.2f}입니다. "
-        f"누적 RMSE는 {rmse_percent:.2f}%로 계산되고 있으며 예측 방향은 {direction}입니다."
+        f"{timestamp.strftime('%Y-%m-%d %H:%M')} 시점 실제값은 {y:.2f} MWh, 예측값은 {y_hat:.2f} MWh입니다. "
+        f"절대 오차는 {abs(y - y_hat):.2f} MWh이며 단기 RMSE_24h는 {_format_metric(rmse_24h)} MWh, "
+        f"장기 RMSE_168h는 {_format_metric(rmse_168h)} MWh입니다. 현재 상태는 {status}이고 예측 방향은 {direction}입니다."
     )
     if retrain:
         return (
-            f"{base} 재학습이 즉시 트리거되었습니다. 사유는 {retrain_reason}. "
-            f"현재까지 총 재학습 횟수는 {retrain_points}회입니다."
+            f"{base} 장기 RMSE가 임계값 {threshold:.2f} MWh를 초과해 재학습이 실행되었습니다. "
+            f"사유는 {retrain_reason}. 현재까지 총 재학습 횟수는 {retrain_count}회입니다."
         )
-    return f"{base} 현재 파이프라인은 정상 스트리밍 상태이며 임계치 이내에서 운영 중입니다."
+    return f"{base} 현재 재학습 임계값은 {threshold:.2f} MWh이며 파이프라인은 해당 상태 기준으로 운영 중입니다."
+
+
+def _classify_stream_status(rmse_24h: float | None, rmse_168h: float | None, baseline_rmse: float) -> str:
+    if rmse_24h is None or rmse_168h is None:
+        return "warming_up"
+    return classify_status(rmse_24h, rmse_168h, baseline_rmse)
+
+
+def _safe_round(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    return round(float(value), 2)
+
+
+def _format_metric(value: float | None) -> str:
+    return "-" if value is None else f"{value:.2f}"
+
+
+def _read_last_retrain_timestamp() -> str | None:
+    if not STATE_PATH.exists():
+        return None
+    try:
+        state = json.loads(STATE_PATH.read_text())
+        return state.get("last_retrain")
+    except Exception:
+        return None

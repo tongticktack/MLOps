@@ -40,8 +40,4 @@ async def predict(file: UploadFile = File(...)):
 async def mlops_stream(websocket: WebSocket):
     await websocket.accept()
     session_id = websocket.query_params.get("session_id", "")
-    try:
-        threshold = float(websocket.query_params.get("threshold", "5.0"))
-    except ValueError:
-        threshold = 5.0
-    await stream_prediction_session(websocket=websocket, session_id=session_id, threshold=threshold)
+    await stream_prediction_session(websocket=websocket, session_id=session_id)

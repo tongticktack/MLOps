@@ -1,8 +1,12 @@
 fastapi
 uvicorn
+websockets
 python-multipart
 pandas
 numpy
 scikit-learn
 matplotlib
 mlflow
+xgboost
+holidays
+joblib
