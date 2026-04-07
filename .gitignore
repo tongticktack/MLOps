@@ -1,7 +1,25 @@
 .DS_Store
 
-__pycache__
-.env
-.venv
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-myenv
+.env
+.env.*
+.venv/
+venv/
+myenv/
+
+node_modules/
+FE/node_modules/
+FE/dist/
+dist/
+
+mlruns/
+
+*.pyc
+*.pyo
+*.pyd
